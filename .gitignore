@@ -9,3 +9,8 @@ temp
 *.pyth
 todel
 .vscode
+*.pt 
+*.ckpt
+*.mp4
+*.mp3
+*.wav

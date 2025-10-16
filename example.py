@@ -12,7 +12,17 @@ from dataset.transforms import make_class_grid, quantize_offset
 from utils.utils import check_if_file_exists_else_download, which_ffmpeg
 from scripts.train_utils import get_model, get_transforms, prepare_inputs
 
+'''
 
+python example.py \
+  --exp_name "24-01-04T16-39-21" \
+  --vid_path "/data/10s.mp4" \
+  --offset_sec 1.6
+
+
+
+
+'''
 def reencode_video(path, vfps=25, afps=16000, in_size=256):
     assert which_ffmpeg() != '', 'Is ffmpeg installed? Check if the conda environment is activated.'
     new_path = Path.cwd() / 'vis' / f'{Path(path).stem}_{vfps}fps_{in_size}side_{afps}hz.mp4'
