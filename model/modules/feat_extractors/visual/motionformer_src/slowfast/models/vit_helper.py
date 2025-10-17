@@ -31,12 +31,8 @@ default_cfgs = {
 }
 
 
-def qkv_attn(q, k, v, tok_mask: torch.Tensor = None):
+def qkv_attn(q, k, v):
     sim = einsum('b i d, b j d -> b i j', q, k)
-    # apply masking if provided, tok_mask is (B*S*H, N): 1s - keep; sim is (B*S*H, H, N, N)
-    if tok_mask is not None:
-        BSH, N = tok_mask.shape
-        sim = sim.masked_fill(tok_mask.view(BSH, 1, N) == 0, float('-inf'))  # 1 - broadcasts across N
     attn = sim.softmax(dim=-1)
     out = einsum('b i j, b j d -> b i d', attn, v)
     return out
@@ -60,13 +56,13 @@ class JointSpaceTimeAttention(nn.Module):
     def forward(self, x, seq_len=196, num_frames=8, approx='none', num_landmarks=128):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(
-            B, N, 3,
-            self.num_heads,
+            B, N, 3, 
+            self.num_heads, 
             C // self.num_heads
         ).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # Joint space-time attention
+        # Joint space-time attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -88,7 +84,7 @@ class DividedAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
-        # init to zeros
+        # init to zeros
         self.qkv.weight.data.fill_(0)
         self.qkv.bias.data.fill_(0)
         self.proj.weight.data.fill_(1)
@@ -97,34 +93,30 @@ class DividedAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, einops_from, einops_to, tok_mask: torch.Tensor = None, **einops_dims):
+    def forward(self, x, einops_from, einops_to, **einops_dims):
         # num of heads variable
         h = self.num_heads
 
         # project x to q, k, v vaalues
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-        if tok_mask is not None:
-            # replicate token mask across heads (b, n) -> (b, h, n) -> (b*h, n) -- same as qkv but w/o d
-            assert len(tok_mask.shape) == 2
-            tok_mask = tok_mask.unsqueeze(1).expand(-1, h, -1).reshape(-1, tok_mask.shape[1])
+        q, k, v = map(lambda t: rearrange(
+            t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        # Scale q
+        # Scale q
         q *= self.scale
 
-        # Take out cls_q, cls_k, cls_v
-        (cls_q, q_), (cls_k, k_), (cls_v, v_) = map(lambda t: (t[:, 0:1], t[:, 1:]), (q, k, v))
-        # the same for masking
-        if tok_mask is not None:
-            cls_mask, mask_ = tok_mask[:, 0:1], tok_mask[:, 1:]
-        else:
-            cls_mask, mask_ = None, None
+        # Take out cls_q, cls_k, cls_v
+        (cls_q, q_), (cls_k, k_), (cls_v, v_) = map(
+            lambda t: (t[:, 0:1], t[:, 1:]), (q, k, v))
 
         # let CLS token attend to key / values of all patches across time and space
-        cls_out = qkv_attn(cls_q, k, v, tok_mask=tok_mask)
+        cls_out = qkv_attn(cls_q, k, v)
 
         # rearrange across time or space
-        q_, k_, v_ = map(lambda t: rearrange(t, f'{einops_from} -> {einops_to}', **einops_dims), (q_, k_, v_))
+        q_, k_, v_ = map(
+            lambda t: rearrange(t, f'{einops_from} -> {einops_to}', **einops_dims), 
+            (q_, k_, v_)
+        )
 
         # expand CLS token keys and values across time or space and concat
         r = q_.shape[0] // cls_k.shape[0]
@@ -133,15 +125,8 @@ class DividedAttention(nn.Module):
         k_ = torch.cat((cls_k, k_), dim=1)
         v_ = torch.cat((cls_v, v_), dim=1)
 
-        # the same for masking (if provided)
-        if tok_mask is not None:
-            # since mask does not have the latent dim (d), we need to remove it from einops dims
-            mask_ = rearrange(mask_, f'{einops_from} -> {einops_to}'.replace(' d', ''), **einops_dims)
-            cls_mask = repeat(cls_mask, 'b () -> (b r) ()', r=r)  # expand cls_mask across time or space
-            mask_ = torch.cat((cls_mask, mask_), dim=1)
-
         # attention
-        out = qkv_attn(q_, k_, v_, tok_mask=mask_)
+        out = qkv_attn(q_, k_, v_)
 
         # merge back time or space
         out = rearrange(out, f'{einops_to} -> {einops_from}', **einops_dims)
@@ -151,7 +136,7 @@ class DividedAttention(nn.Module):
 
         # merge back the heads
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-
+        
         ## to out
         x = self.proj(out)
         x = self.proj_drop(x)
@@ -171,7 +156,7 @@ class TrajectoryAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-
+        
         # A typo in the original code meant that the value tensors for the temporal
         # attention step were identical to the input instead of being multiplied by a
         # learned projection matrix (v = x rather than v = Wx). The original code is
@@ -188,10 +173,12 @@ class TrajectoryAttention(nn.Module):
         q, k, v = self.qkv(x).chunk(3, dim=-1)
 
         # Reshape: 'b n (h d) -> (b h) n d'
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        q, k, v = map(
+            lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
         # remove CLS token from q, k, v
-        (cls_q, q_), (cls_k, k_), (cls_v, v_) = map(lambda t: (t[:, 0:1], t[:, 1:]), (q, k, v))
+        (cls_q, q_), (cls_k, k_), (cls_v, v_) = map(
+            lambda t: (t[:, 0:1], t[:, 1:]), (q, k, v))
 
         # let CLS token attend to key / values of all patches across time and space
         cls_out = qkv_attn(cls_q * self.scale, k, v)
@@ -199,7 +186,8 @@ class TrajectoryAttention(nn.Module):
 
         if approx == "nystrom":
             ## Shared spatial landmarks
-            q_, k_, v_ = map(lambda t: rearrange(t, f'b h p d -> (b h) p d', h=h), (q_, k_, v_))
+            q_, k_, v_ = map(
+                lambda t: rearrange(t, f'b h p d -> (b h) p d', h=h), (q_, k_, v_))
             x = nystrom_helper.nystrom_spatial_attn(
                 q_, k_, v_,
                 landmarks=num_landmarks,
@@ -224,13 +212,13 @@ class TrajectoryAttention(nn.Module):
                 m, d, seed=seed, device=q_.device, dtype=q_.dtype)
             q_, k_ = map(lambda t: rearrange(t, f'b h p d -> b p h d'), (q_, k_))
             q_prime = performer_helper.softmax_kernel_transformation(
-                q_,
-                is_query=True,
+                q_, 
+                is_query=True, 
                 projection_matrix=projection_matrix
             )
             k_prime = performer_helper.softmax_kernel_transformation(
-                k_,
-                is_query=False,
+                k_, 
+                is_query=False, 
                 projection_matrix=projection_matrix
             )
             q_prime, k_prime = map(
@@ -251,7 +239,7 @@ class TrajectoryAttention(nn.Module):
             v_ = rearrange(v_, 'b (f n) d -> b f n d', f=F, n=P)
             x = torch.einsum('b q f n, b f n d -> b q f d', attn, v_)
 
-        # Temporal attention: query is the similarity-aggregated patch
+        # Temporal attention: query is the similarity-aggregated patch
         x = rearrange(x, '(b h) s f d -> b s f (h d)', b=B)
         x_diag = rearrange(x, 'b (g n) f d -> b g n f d', g=F)
         x_diag = torch.diagonal(x_diag, dim1=-4, dim2=-2)
@@ -260,7 +248,8 @@ class TrajectoryAttention(nn.Module):
         k2, v2 = self.proj_kv(x).chunk(2, dim=-1)
         q2 = rearrange(q2, f'b s (h d) -> b h s d', h=h)
         q2 *= self.scale
-        k2, v2 = map(lambda t: rearrange(t, f'b s f (h d) -> b h s f d', f=F,  h=h), (k2, v2))
+        k2, v2 = map(
+            lambda t: rearrange(t, f'b s f (h d) -> b h s f d', f=F,  h=h), (k2, v2))
         attn = torch.einsum('b h s d, b h s f d -> b h s f', q2, k2)
         attn = attn.softmax(dim=-1)
         if self.use_original_code:
@@ -279,16 +268,16 @@ class TrajectoryAttention(nn.Module):
 
 
 def get_attention_module(
-    attn_type='joint', dim=768, num_heads=12, qkv_bias=False,
+    attn_type='joint', dim=768, num_heads=12, qkv_bias=False, 
     attn_drop=0., proj_drop=0., use_original_code=True
 ):
     if attn_type == 'joint':
         attn = JointSpaceTimeAttention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, 
             attn_drop=attn_drop, proj_drop=proj_drop)
     elif attn_type == 'trajectory':
         attn = TrajectoryAttention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, 
             attn_drop=attn_drop, proj_drop=proj_drop,
             use_original_code=use_original_code)
     return attn
@@ -297,15 +286,15 @@ def get_attention_module(
 class Block(nn.Module):
 
     def __init__(
-            self, dim=768, num_heads=12, attn_type='trajectory',
-            mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
+            self, dim=768, num_heads=12, attn_type='trajectory', 
+            mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., 
             drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
             use_original_code=True
         ):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = get_attention_module(
-            attn_type=attn_type, dim=dim, num_heads=num_heads,
+            attn_type=attn_type, dim=dim, num_heads=num_heads, 
             qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
             use_original_code=use_original_code
         )
@@ -318,9 +307,9 @@ class Block(nn.Module):
     def forward(self, x, seq_len=196, num_frames=8, approx='none', num_landmarks=128):
         x = x + self.drop_path(
             self.attn(
-                self.norm1(x),
-                seq_len=seq_len,
-                num_frames=num_frames,
+                self.norm1(x), 
+                seq_len=seq_len, 
+                num_frames=num_frames, 
                 approx=approx,
                 num_landmarks=num_landmarks
             )[0]
@@ -332,7 +321,7 @@ class Block(nn.Module):
 class DividedSpaceTimeBlock(nn.Module):
 
     def __init__(
-        self, dim=768, num_heads=12, attn_type='divided',
+        self, dim=768, num_heads=12, attn_type='divided', 
         mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
         drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm
     ):
@@ -344,31 +333,30 @@ class DividedSpaceTimeBlock(nn.Module):
         self.einops_to_time = '(b n) f d'
 
         self.norm1 = norm_layer(dim)
-
+        
         self.attn = DividedAttention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, 
             attn_drop=attn_drop, proj_drop=drop)
 
         self.timeattn = DividedAttention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, 
             attn_drop=attn_drop, proj_drop=drop)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(
-            in_features=dim, hidden_features=mlp_hidden_dim,
+            in_features=dim, hidden_features=mlp_hidden_dim, 
             act_layer=act_layer, drop=drop)
         self.norm3 = norm_layer(dim)
 
-    def forward(self, x, seq_len=196, num_frames=8, approx='none', num_landmarks=128,
-                tok_mask: torch.Tensor = None):
-        time_output = self.timeattn(self.norm3(x), self.einops_from_time, self.einops_to_time, n=seq_len,
-                                    tok_mask=tok_mask)
+    def forward(self, x, seq_len=196, num_frames=8, approx='none', num_landmarks=128):
+        time_output = self.timeattn(self.norm3(x), 
+            self.einops_from_time, self.einops_to_time, n=seq_len)
         time_residual = x + time_output
 
-        space_output = self.attn(self.norm1(time_residual), self.einops_from_space, self.einops_to_space,
-                                 f=num_frames, tok_mask=tok_mask)
+        space_output = self.attn(self.norm1(time_residual), 
+            self.einops_from_space, self.einops_to_space, f=num_frames)
         space_residual = time_residual + self.drop_path(space_output)
 
         x = space_residual
@@ -378,7 +366,7 @@ class DividedSpaceTimeBlock(nn.Module):
 
 class Mlp(nn.Module):
     def __init__(
-        self, in_features, hidden_features=None,
+        self, in_features, hidden_features=None, 
         out_features=None, act_layer=nn.GELU, drop=0.
     ):
         super().__init__()
@@ -420,21 +408,20 @@ class PatchEmbed(nn.Module):
 
 
 class PatchEmbed3D(nn.Module):
-    """ Image to Patch Embedding """
+    """ Image to Patch Embedding
+    """
     def __init__(
-            self, img_size=224, temporal_resolution=4, in_chans=3,
+            self, img_size=224, temporal_resolution=4, in_chans=3, 
             patch_size=16, z_block_size=2, embed_dim=768, flatten=True
         ):
         super().__init__()
         self.height = (img_size // patch_size)
         self.width = (img_size // patch_size)
-        ### v-iashin: these two are incorrect
-        # self.frames = (temporal_resolution // z_block_size)
-        # self.num_patches = self.height * self.width * self.frames
-        self.z_block_size = z_block_size
-        ###
-        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=(z_block_size, patch_size, patch_size),
-                              stride=(z_block_size, patch_size, patch_size))
+        self.frames = (temporal_resolution // z_block_size)
+        self.num_patches = self.height * self.width * self.frames
+        self.proj = nn.Conv3d(in_chans, embed_dim,
+            kernel_size=(z_block_size, patch_size, patch_size), 
+            stride=(z_block_size, patch_size, patch_size))
         self.flatten = flatten
 
     def forward(self, x):
@@ -520,10 +507,10 @@ def adapt_input_conv(in_chans, conv_weight, agg='sum'):
 def load_pretrained(
     model, cfg=None, num_classes=1000, in_chans=3, filter_fn=None, strict=True, progress=False
 ):
-    # Load state dict
+    # Load state dict
     assert(f"{cfg.VIT.PRETRAINED_WEIGHTS} not in [vit_1k, vit_1k_large]")
     state_dict = torch.hub.load_state_dict_from_url(url=default_cfgs[cfg.VIT.PRETRAINED_WEIGHTS])
-
+    
     if filter_fn is not None:
         state_dict = filter_fn(state_dict)
 
